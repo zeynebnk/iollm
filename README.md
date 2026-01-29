@@ -1,5 +1,6 @@
 # IOLLM
 ## Language, Reasoning, and Latent Learning
+[`zeynebnk/iollm`](https://huggingface.co/datasets/zeynebnk/iollm)
 
 The rapid progress of models on many benchmarks, including medal-level performance in international olympiads such as computing and mathematics, has brought them recognition as 'general reasoners'. But there's still a gap between how we talk about reasoning and how we measure it. Rather than asking whether models reason, IOLLM aims to isolate the mechanisms of reasoning in language models, and where that process breaks down, and use that to drive their reasoning further.
 
@@ -45,10 +46,6 @@ evaluation.py
   --dataset, -d    HuggingFace dataset for solutions
   -k               grade k times, majority vote
 ```
-
-## dataset
-Default: `zeynebnk/iollm`
-Fields: `year`, `problem_number`, `problem_text`, `solution`
 
 ## logic
 tools for analyzing logical structure of problems:
