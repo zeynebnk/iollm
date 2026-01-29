@@ -6,19 +6,18 @@ The rapid progress of models on many benchmarks, including medal-level performan
 
 IOLLM is a project on rule induction as reasoning: how do language models infer a latent system from a tiny set of examples, and then generalize it correctly to new queries? We turn to the Linguistics Olympiad, the olympiad perhaps most aligned for language models. With self-contained problems requiring multi-step and compositional reasoning, it serves as an abstractable way to examine reasoning in language models. 
 
-This repo contains code used to evaluate reasoning performance of language models on IOLLM. We isolate the impact of 'reasoning' on performance: we isolate representation (mis)alignment, contamination and prior knowledge, and formalize identifiability and information flow to connect forms of logical complexity to identify reasoning failures. This challenging frontier eval measures broadly relevant capabilities in hierarchical multi-step reasoning and efficient in-context deduction and is a well-grounded and useful framework.  
+This repo contains code used to evaluate reasoning performance of language models on IOLLM. It decomposes 'reasoning' in performance: it isolates confounds of representation (mis)alignment and contamination/prior knowledge, and formalize identifiability and information flow to connect forms of logical complexity to identify reasoning failures. This challenging frontier eval measures broadly relevant capabilities in hierarchical multi-step reasoning and efficient in-context deduction and is a well-grounded and useful framework.  
 
-## setup
+I am beyond grateful for Kristian Georgiev and Jackie Hehir at OpenAI for their invaluable support and the opportunity to work on exciting research with incredible people.  
+
+## evals usage
 
 ```bash
+# setup
 pip install -r requirements.txt
 ```
 
-## usage
-
 ```bash
-cd iollm/evals
-
 # inference
 python inference.py --model gpt-5.2 --reasoning high
 python inference.py --model gpt-5.2 --batch
@@ -29,7 +28,7 @@ python evaluation.py results/gpt-5-2_high.json
 python evaluation.py results/gpt-5-2_high.json -k 3  # majority vote
 ```
 
-## options
+# options
 
 ```
 inference.py
