@@ -62,7 +62,7 @@ result.curve      # ambiguity reduction curve
 ```
 
 computes:
-- **identifiability**: can each token be uniquely determined?
-- **certificates**: minimal evidence needed for identification  
-- **ambiguity curves**: how ambiguity decreases with more examples
-- **constraint graph**: co-occurrence structure, treewidth
+- identifiability: can each token be uniquely determined?
+- certificates: minimal evidence needed for identification  
+- ambiguity curves: how ambiguity decreases with more examples
+- constraint graph: co-occurrence structure, treewidth
