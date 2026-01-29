@@ -1,29 +1,27 @@
-"""inference"""
 import asyncio
 import json
 import time
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv
 
-load_dotenv()
+from .api import (
+    client, async_client, pid, save_json, load_json,
+    load_problems, RESULTS_DIR, IOLLM_DATASET
+)
+from .prompts import SOLVER
 
-try:
-    from .api import client, async_client, is_gpt5, save_json, load_json, load_problems, IOLLM_DATASET
-    from .prompts import SOLVER
-except ImportError:
-    from api import client, async_client, is_gpt5, save_json, load_json, load_problems, IOLLM_DATASET
-    from prompts import SOLVER
-
-RESULTS_DIR = Path(__file__).parent.parent / "results"
 TRACKING_FILE = RESULTS_DIR / "tracking.json"
 
+REASONING_EFFORTS = ["none", "low", "medium", "high"]
 
-def pid(p):
-    return f"{p['year']}_p{p['problem_number']}"
 
-def prompt(p):
-    return f"{SOLVER}\n\n{p['problem_text']}"
+def make_prompt(problem):
+    return f"{SOLVER}\n\n{problem['problem_text']}"
+
+
+def is_reasoning_model(model):
+    return model.startswith("o") or "5" in model
+
 
 def filter_problems(problems, years=None, nums=None):
     if years:
@@ -36,46 +34,36 @@ def filter_problems(problems, years=None, nums=None):
 # tracking
 
 def load_tracking():
-    return load_json(TRACKING_FILE) if TRACKING_FILE.exists() else {"jobs": {}, "responses": {}}
+    return load_json(TRACKING_FILE) if TRACKING_FILE.exists() else {"jobs": {}}
+
 
 def save_tracking(t):
     save_json(t, TRACKING_FILE)
 
-def track(resp_id=None, batch_id=None, **meta):
+
+def track_job(batch_id, **meta):
     t = load_tracking()
     meta["created"] = datetime.now().isoformat()
-    if resp_id:
-        t["responses"][resp_id] = meta
-    if batch_id:
-        t["jobs"][batch_id] = meta
+    t["jobs"][batch_id] = meta
     save_tracking(t)
 
 
-# realtime
+# realtime inference
 
 async def infer_one(prob, model, reasoning, dataset):
     t0 = time.time()
-    resp_id, usage = None, {}
     problem_id = pid(prob)
 
     try:
-        if is_gpt5(model):
+        if is_reasoning_model(model) and reasoning != "none":
+            # reasoning model with effort control
             r = await async_client.responses.create(
-                model=model, input=prompt(prob),
-                reasoning={"effort": reasoning}, store=True, background=True
+                model=model,
+                input=make_prompt(prob),
+                reasoning={"effort": reasoning}
             )
-            resp_id = r.id
-            track(resp_id=resp_id, problem_id=problem_id, model=model,
-                  reasoning=reasoning, dataset=dataset, status="pending")
-
-            while r.status in ("queued", "in_progress"):
-                await asyncio.sleep(5)
-                r = client.responses.retrieve(resp_id)
-
-            if r.status != "completed":
-                raise Exception(f"status: {r.status}")
-
             text = r.output_text
+            usage = {}
             if r.usage:
                 usage = {
                     "input": r.usage.input_tokens,
@@ -84,41 +72,55 @@ async def infer_one(prob, model, reasoning, dataset):
                                  if r.usage.output_tokens_details else 0
                 }
         else:
+            # standard chat completion
             r = await async_client.chat.completions.create(
-                model=model, messages=[{"role": "user", "content": prompt(prob)}]
+                model=model,
+                messages=[{"role": "user", "content": make_prompt(prob)}]
             )
-            resp_id = getattr(r, 'id', None)
             text = r.choices[0].message.content
+            usage = {}
             if r.usage:
                 usage = {"input": r.usage.prompt_tokens, "output": r.usage.completion_tokens}
+                if hasattr(r.usage, 'completion_tokens_details') and r.usage.completion_tokens_details:
+                    usage["reasoning"] = getattr(r.usage.completion_tokens_details, 'reasoning_tokens', 0)
 
         return {
-            "problem_id": problem_id, "response": text, "response_id": resp_id,
-            "model": model, "reasoning": reasoning, "dataset": dataset,
-            "usage": usage, "latency": time.time() - t0, "error": None
+            "problem_id": problem_id,
+            "response": text,
+            "model": model,
+            "reasoning": reasoning,
+            "dataset": dataset,
+            "usage": usage,
+            "latency": round(time.time() - t0, 1),
+            "error": None
         }
     except Exception as e:
         return {
-            "problem_id": problem_id, "response": "", "response_id": resp_id,
-            "model": model, "reasoning": reasoning, "dataset": dataset,
-            "usage": usage, "latency": time.time() - t0, "error": str(e)
+            "problem_id": problem_id,
+            "response": "",
+            "model": model,
+            "reasoning": reasoning,
+            "dataset": dataset,
+            "usage": {},
+            "latency": round(time.time() - t0, 1),
+            "error": str(e)
         }
 
 
-async def infer_all(probs, model, reasoning, dataset, workers=4, output=None):
+async def infer_all(probs, model, reasoning, dataset, workers, output=None):
     sem = asyncio.Semaphore(workers)
     results = []
 
-    async def go(p, i):
+    async def go(p):
         async with sem:
             r = await infer_one(p, model, reasoning, dataset)
             results.append(r)
-            ok = "✓" if not r["error"] else "✗"
-            print(f"[{len(results)}/{len(probs)}] {ok} {r['problem_id']} ({r['latency']:.0f}s)")
+            status = "ok" if not r["error"] else "err"
+            print(f"[{len(results)}/{len(probs)}] {status} {r['problem_id']} ({r['latency']}s)")
             if output and len(results) % 5 == 0:
-                save_json({"metadata": {}, "results": results}, output)
+                save_json({"metadata": {"model": model, "reasoning": reasoning}, "results": results}, output)
 
-    await asyncio.gather(*[go(p, i) for i, p in enumerate(probs)])
+    await asyncio.gather(*[go(p) for p in probs])
     return results
 
 
@@ -129,7 +131,7 @@ def run_inference(model="gpt-5.2", reasoning="high", dataset=IOLLM_DATASET,
         print("no problems match filters")
         return
 
-    print(f"running {len(probs)} problems | {model} | {reasoning}")
+    print(f"running {len(probs)} problems with {model} (reasoning={reasoning})")
     start = datetime.now()
     results = asyncio.run(infer_all(probs, model, reasoning, dataset, workers, output))
 
@@ -138,18 +140,24 @@ def run_inference(model="gpt-5.2", reasoning="high", dataset=IOLLM_DATASET,
 
     out = {
         "metadata": {
-            "model": model, "reasoning": reasoning, "dataset": dataset,
-            "n_problems": len(probs), "n_success": n_ok, "n_failed": len(results) - n_ok,
-            "started": start.isoformat(), "finished": datetime.now().isoformat()
+            "model": model,
+            "reasoning": reasoning,
+            "dataset": dataset,
+            "n_problems": len(probs),
+            "n_success": n_ok,
+            "n_failed": len(results) - n_ok,
+            "started": start.isoformat(),
+            "finished": datetime.now().isoformat()
         },
         "results": results
     }
     if output:
         save_json(out, output)
+        print(f"saved: {output}")
     return out
 
 
-# batch
+# batch inference
 
 def submit_batch(model="gpt-5.2", reasoning="high", dataset=IOLLM_DATASET,
                  output=None, years=None, problems=None):
@@ -160,74 +168,128 @@ def submit_batch(model="gpt-5.2", reasoning="high", dataset=IOLLM_DATASET,
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     batch_file = RESULTS_DIR / f"batch_input_{int(time.time())}.jsonl"
-    endpoint = "/v1/responses" if is_gpt5(model) else "/v1/chat/completions"
-    problem_ids = []
+
+    use_responses = is_reasoning_model(model) and reasoning != "none"
+    endpoint = "/v1/responses" if use_responses else "/v1/chat/completions"
 
     with open(batch_file, "w") as f:
         for p in probs:
-            problem_ids.append(pid(p))
-            if is_gpt5(model):
-                body = {"model": model, "input": prompt(p), "reasoning": {"effort": reasoning}}
+            if use_responses:
+                body = {
+                    "model": model,
+                    "input": make_prompt(p),
+                    "reasoning": {"effort": reasoning}
+                }
             else:
-                body = {"model": model, "messages": [{"role": "user", "content": prompt(p)}]}
-            f.write(json.dumps({"custom_id": pid(p), "method": "POST", "url": endpoint, "body": body}) + "\n")
+                body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": make_prompt(p)}]
+                }
+            req = {"custom_id": pid(p), "method": "POST", "url": endpoint, "body": body}
+            f.write(json.dumps(req) + "\n")
 
-    file = client.files.create(file=open(batch_file, "rb"), purpose="batch")
-    batch = client.batches.create(input_file_id=file.id, endpoint=endpoint, completion_window="24h")
+    with open(batch_file, "rb") as f:
+        uploaded = client.files.create(file=f, purpose="batch")
+    batch = client.batches.create(
+        input_file_id=uploaded.id,
+        endpoint=endpoint,
+        completion_window="24h"
+    )
 
-    track(batch_id=batch.id, status=batch.status, model=model, reasoning=reasoning,
-          dataset=dataset, n_problems=len(probs), problem_ids=problem_ids,
-          output=str(output) if output else None, input_file_id=file.id, years=years)
+    track_job(
+        batch_id=batch.id,
+        status=batch.status,
+        model=model,
+        reasoning=reasoning,
+        dataset=dataset,
+        n_problems=len(probs),
+        output=str(output) if output else None,
+        input_file=str(batch_file),
+        years=years
+    )
 
     print(f"submitted: {batch.id}")
-    print(f"  {len(probs)} problems | {model} | {reasoning}")
+    print(f"  {len(probs)} problems | {model} | reasoning={reasoning}")
     return {"batch_id": batch.id, "n_problems": len(probs)}
 
 
-def download_batch(batch_id, output, job_info=None):
+def check_batch(batch_id):
+    b = client.batches.retrieve(batch_id)
+    counts = b.request_counts
+    progress = f"{counts.completed}/{counts.total}" if counts else "?"
+    print(f"{batch_id}: {b.status} ({progress})")
+    return b
+
+
+def download_batch(batch_id, output=None):
     b = client.batches.retrieve(batch_id)
     if b.status != "completed":
-        return None, b.status
+        print(f"batch not ready: {b.status}")
+        return None
 
-    raw = RESULTS_DIR / f"{batch_id}.jsonl"
-    raw.write_bytes(client.files.content(b.output_file_id).read())
+    t = load_tracking()
+    job_info = t.get("jobs", {}).get(batch_id, {})
+
+    raw_file = RESULTS_DIR / f"{batch_id}.jsonl"
+    raw_file.write_bytes(client.files.content(b.output_file_id).read())
 
     results = []
-    for line in open(raw):
-        item = json.loads(line)
-        body = item.get("response", {}).get("body", {})
-        text = body.get("output_text") or body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    with open(raw_file) as f:
+        for line in f:
+            item = json.loads(line)
+            body = item.get("response", {}).get("body", {})
 
-        usage = body.get("usage", {})
-        usage_out = {"input": usage.get("input_tokens", 0), "output": usage.get("output_tokens", 0)}
-        if usage.get("output_tokens_details"):
-            usage_out["reasoning"] = usage["output_tokens_details"].get("reasoning_tokens", 0)
+            # handle both responses API and chat completions API
+            text = body.get("output_text") or body.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-        result = {
-            "problem_id": item["custom_id"],
-            "response": text,
-            "response_id": body.get("id"),
-            "model": body.get("model") or (job_info.get("model") if job_info else None),
-            "reasoning": (body.get("reasoning", {}) or {}).get("effort") or (job_info.get("reasoning") if job_info else None),
-            "dataset": job_info.get("dataset") if job_info else None,
-            "batch_id": batch_id,
-            "usage": usage_out,
-            "error": str(item["error"]) if item.get("error") else None
-        }
-        results.append(result)
-        if result["response_id"]:
-            track(resp_id=result["response_id"], problem_id=result["problem_id"],
-                  model=result["model"], reasoning=result["reasoning"],
-                  dataset=result["dataset"], status="completed", batch_id=batch_id)
+            usage = body.get("usage", {})
+            usage_out = {
+                "input": usage.get("input_tokens") or usage.get("prompt_tokens", 0),
+                "output": usage.get("output_tokens") or usage.get("completion_tokens", 0)
+            }
+            if usage.get("output_tokens_details"):
+                usage_out["reasoning"] = usage["output_tokens_details"].get("reasoning_tokens", 0)
+            elif usage.get("completion_tokens_details"):
+                usage_out["reasoning"] = usage["completion_tokens_details"].get("reasoning_tokens", 0)
+
+            results.append({
+                "problem_id": item["custom_id"],
+                "response": text,
+                "model": body.get("model") or job_info.get("model"),
+                "reasoning": job_info.get("reasoning"),
+                "dataset": job_info.get("dataset"),
+                "batch_id": batch_id,
+                "usage": usage_out,
+                "error": str(item["error"]) if item.get("error") else None
+            })
 
     n_ok = sum(1 for r in results if not r["error"])
-    save_json({"metadata": {"batch_id": batch_id, "n_problems": len(results), "n_success": n_ok}, "results": results}, output)
-    return results, output
+    out = {
+        "metadata": {
+            "batch_id": batch_id,
+            "model": job_info.get("model"),
+            "reasoning": job_info.get("reasoning"),
+            "dataset": job_info.get("dataset"),
+            "n_problems": len(results),
+            "n_success": n_ok,
+            "n_failed": len(results) - n_ok
+        },
+        "results": results
+    }
+
+    output = output or job_info.get("output") or (RESULTS_DIR / f"{batch_id}.json")
+    save_json(out, output)
+    print(f"downloaded: {output} ({n_ok}/{len(results)} ok)")
+
+    if batch_id in t.get("jobs", {}):
+        t["jobs"][batch_id]["status"] = "completed"
+        t["jobs"][batch_id]["downloaded"] = datetime.now().isoformat()
+        save_tracking(t)
+
+    return out
 
 
-# job management
-
-def check_batches(download=True):
+def check_batches(auto_download=True):
     t = load_tracking()
     jobs = t.get("jobs", {})
     if not jobs:
@@ -238,78 +300,24 @@ def check_batches(download=True):
     for batch_id, info in jobs.items():
         try:
             b = client.batches.retrieve(batch_id)
-            old = info.get("status")
+            was_pending = info.get("status") != "completed"
             info["status"] = b.status
+            counts = b.request_counts
+            progress = f"({counts.completed}/{counts.total})" if counts else ""
+            print(f"  {batch_id[:24]}... {b.status} {progress} | {info.get('model')} | {info.get('reasoning')}")
 
-            progress = f"({b.request_counts.completed}/{b.request_counts.total})" if b.request_counts else ""
-            icon = {"completed": "✓", "failed": "✗", "expired": "⏰"}.get(b.status, "⏳")
-            print(f"{icon} {batch_id[:30]}... {b.status} {progress} | {info.get('model')} | {info.get('n_problems')} problems")
-
-            if download and b.status == "completed" and old != "completed":
-                output = info.get("output") or str(RESULTS_DIR / f"{batch_id}.json")
-                results, path = download_batch(batch_id, Path(output), info)
-                if results:
-                    n_ok = sum(1 for r in results if not r["error"])
-                    print(f"   → downloaded: {path} ({n_ok}/{len(results)} ok)")
-                    info["downloaded"] = datetime.now().isoformat()
+            if auto_download and b.status == "completed" and was_pending and not info.get("downloaded"):
+                save_tracking(t)
+                download_batch(batch_id)
+                t = load_tracking()
         except Exception as e:
-            print(f"? {batch_id[:30]}... error: {e}")
+            print(f"  {batch_id[:24]}... error: {e}")
 
     save_tracking(t)
     statuses = [j.get("status") for j in jobs.values()]
-    print(f"\n{statuses.count('completed')} done, {statuses.count('in_progress')} running, {statuses.count('failed')} failed")
-
-
-def check_responses():
-    t = load_tracking()
-    pending = {k: v for k, v in t.get("responses", {}).items() if v.get("status") != "recovered"}
-    if not pending:
-        print("no pending responses")
-        return
-
-    print(f"checking {len(pending)} responses...\n")
-    recovered, to_remove = [], []
-
-    for resp_id, info in list(pending.items()):
-        try:
-            r = client.responses.retrieve(resp_id)
-            if r.status == "completed":
-                usage = {}
-                if r.usage:
-                    usage = {
-                        "input": r.usage.input_tokens,
-                        "output": r.usage.output_tokens,
-                        "reasoning": getattr(r.usage.output_tokens_details, 'reasoning_tokens', 0)
-                                     if r.usage.output_tokens_details else 0
-                    }
-                recovered.append({
-                    "problem_id": info.get("problem_id", "unknown"),
-                    "response": r.output_text,
-                    "response_id": resp_id,
-                    "model": info.get("model") or r.model,
-                    "reasoning": info.get("reasoning"),
-                    "dataset": info.get("dataset"),
-                    "usage": usage,
-                    "error": None
-                })
-                to_remove.append(resp_id)
-                print(f"✓ {info.get('problem_id', resp_id[:20])} recovered")
-            elif r.status in ("queued", "in_progress"):
-                print(f"⏳ {info.get('problem_id', resp_id[:20])} {r.status}")
-            else:
-                to_remove.append(resp_id)
-                print(f"✗ {info.get('problem_id', resp_id[:20])} {r.status}")
-        except Exception as e:
-            print(f"? {info.get('problem_id', resp_id[:20])} {e}")
-
-    for rid in to_remove:
-        t["responses"].pop(rid, None)
-    save_tracking(t)
-
-    if recovered:
-        output = RESULTS_DIR / f"recovered_{int(time.time())}.json"
-        save_json({"metadata": {"type": "recovered"}, "results": recovered}, output)
-        print(f"\n→ saved {len(recovered)} to {output}")
+    completed = statuses.count("completed")
+    running = statuses.count("in_progress") + statuses.count("validating") + statuses.count("finalizing")
+    print(f"\n{completed} done, {running} running")
 
 
 def list_jobs():
@@ -318,33 +326,36 @@ def list_jobs():
         print("no tracked jobs")
         return
     for bid, info in jobs.items():
-        icon = {"completed": "✓", "failed": "✗"}.get(info.get("status"), "⏳")
-        print(f"{icon} {bid} | {info.get('model')} | {info.get('reasoning')} | {info.get('n_problems')} problems")
+        print(f"  {bid} | {info.get('status', '?')} | {info.get('model')} | {info.get('reasoning')} | {info.get('n_problems')} problems")
 
 
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="gpt-5.2")
-    p.add_argument("--reasoning", default="high", choices=["none", "low", "medium", "high"])
+    p.add_argument("--model", "-m", default="gpt-5.2")
+    p.add_argument("--reasoning", "-r", default="high", choices=REASONING_EFFORTS)
+    p.add_argument("--dataset", "-d", default=IOLLM_DATASET)
     p.add_argument("--output", "-o", type=Path)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", "-w", type=int, default=4)
     p.add_argument("--years", type=int, nargs="+")
     p.add_argument("--problems", type=int, nargs="+")
-    p.add_argument("--batch", action="store_true")
-    p.add_argument("--check", action="store_true")
-    p.add_argument("--jobs", action="store_true")
+
+    p.add_argument("--batch", action="store_true", help="submit batch job")
+    p.add_argument("--check", action="store_true", help="check jobs and download if ready")
+    p.add_argument("--download", type=str, metavar="BATCH_ID", help="manually download a batch")
+    p.add_argument("--jobs", action="store_true", help="list tracked jobs")
+
     a = p.parse_args()
 
-    if a.check:
-        check_batches()
-        print()
-        check_responses()
-    elif a.jobs:
+    if a.jobs:
         list_jobs()
+    elif a.check:
+        check_batches()
+    elif a.download:
+        download_batch(a.download, a.output)
     elif a.batch:
-        output = a.output or (RESULTS_DIR / f"{a.model.replace('.', '-')}_{a.reasoning}.json")
-        submit_batch(a.model, a.reasoning, IOLLM_DATASET, output, a.years, a.problems)
+        output = a.output or (RESULTS_DIR / f"{a.model.replace('.', '-')}_{a.reasoning}_batch.json")
+        submit_batch(a.model, a.reasoning, a.dataset, output, a.years, a.problems)
     else:
         output = a.output or (RESULTS_DIR / f"{a.model.replace('.', '-')}_{a.reasoning}.json")
-        run_inference(a.model, a.reasoning, IOLLM_DATASET, output, a.workers, a.years, a.problems)
+        run_inference(a.model, a.reasoning, a.dataset, output, a.workers, a.years, a.problems)

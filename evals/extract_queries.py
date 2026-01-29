@@ -1,28 +1,14 @@
-"""query-answer formatting"""
 import asyncio
 import json
-import re
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+from .api import (
+    async_client, pid, parse_json, save_json, load_json,
+    load_problems, DATA_DIR, IOLLM_DATASET
+)
+from .prompts import EXTRACT_QUERIES
 
-try:
-    from .api import async_client, save_json, load_json, load_problems, QUERIES, IOLLM_DATASET
-    from .prompts import EXTRACT_QUERIES
-except ImportError:
-    from api import async_client, save_json, load_json, load_problems, QUERIES, IOLLM_DATASET
-    from prompts import EXTRACT_QUERIES
-
-
-def pid(p):
-    return f"{p['year']}_p{p['problem_number']}"
-
-def parse_json(text):
-    if not text:
-        return {}
-    m = re.search(r"\{[\s\S]*\}", text)
-    return json.loads(m.group()) if m else {}
+QUERIES_FILE = DATA_DIR / "extracted_queries.json"
 
 
 async def extract_one(sem, prob, i, total):
@@ -55,12 +41,14 @@ def extract_queries(dataset=IOLLM_DATASET, output=None, workers=10):
     extracted = {r["problem_id"]: r["items"] for r in results}
     print(f"\ntotal items: {sum(len(v) for v in extracted.values())}")
 
-    save_json(extracted, output or QUERIES)
-    print(f"saved: {output or QUERIES}")
+    out_path = output or QUERIES_FILE
+    save_json(extracted, out_path)
+    print(f"saved: {out_path}")
     return extracted
 
 
-def update_queries(problem_ids, dataset=IOLLM_DATASET, queries_path=QUERIES):
+def update_queries(problem_ids, dataset=IOLLM_DATASET, queries_path=None):
+    queries_path = queries_path or QUERIES_FILE
     existing = load_json(queries_path) if queries_path.exists() else {}
     problems = [p for p in load_problems(dataset) if pid(p) in problem_ids]
     if not problems:
@@ -80,7 +68,8 @@ def update_queries(problem_ids, dataset=IOLLM_DATASET, queries_path=QUERIES):
     print(f"saved: {queries_path}")
 
 
-def validate_queries(queries_path=QUERIES, dataset=IOLLM_DATASET):
+def validate_queries(queries_path=None, dataset=IOLLM_DATASET):
+    queries_path = queries_path or QUERIES_FILE
     if not queries_path.exists():
         print(f"not found: {queries_path}")
         return
@@ -95,20 +84,21 @@ def validate_queries(queries_path=QUERIES, dataset=IOLLM_DATASET):
         print(f"missing ({len(missing)}): {', '.join(sorted(missing)[:10])}{'...' if len(missing) > 10 else ''}")
     if empty:
         print(f"empty ({len(empty)}): {', '.join(empty[:10])}")
-    print(f"\n{'✓ valid' if not missing else '✗ missing problems'}")
+    print(f"\n{'valid' if not missing else 'missing problems'}")
 
 
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--output", "-o", type=Path, default=QUERIES)
+    p.add_argument("--output", "-o", type=Path)
     p.add_argument("--validate", action="store_true")
     p.add_argument("--update", nargs="+")
     a = p.parse_args()
 
+    path = a.output or QUERIES_FILE
     if a.validate:
-        validate_queries(a.output)
+        validate_queries(path)
     elif a.update:
-        update_queries(a.update, queries_path=a.output)
+        update_queries(a.update, queries_path=path)
     else:
-        extract_queries(output=a.output)
+        extract_queries(output=path)
